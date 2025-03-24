@@ -60,6 +60,7 @@ class FactorizedBilinearPooling(nn.Module):
         return output
 
 # 注意力机制
+# 注意力机制
 class CrossModalAttention(nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
@@ -68,16 +69,21 @@ class CrossModalAttention(nn.Module):
             nn.Linear(hidden_dim * 3, 3),  # 输出3个权重（对应文本/图像/行为）
             nn.Softmax(dim=1)
         )
+        self.img_weight_bias = nn.Parameter(torch.tensor(1.0))
+        self.text_weight_bias = nn.Parameter(torch.tensor(1.0))
+        self.behavior_weight_bias = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, text, img, behavior):
+        img = img * self.img_weight_bias
+        text=text*self.text_weight_bias
+        behavior=behavior*self.behavior_weight_bias
         combined = torch.cat([text, img, behavior], dim=1)  # shape: (batch, hidden*3)
         weights = self.attention(combined)  # shape: (batch, 3)
-        # 扩展权重以匹配原始维度
+
         text_weighted = text * weights[:, 0].unsqueeze(1)
         img_weighted = img * weights[:, 1].unsqueeze(1)
         behavior_weighted = behavior * weights[:, 2].unsqueeze(1)
         return text_weighted, img_weighted, behavior_weighted, weights
-
 # 多模态模型
 class MultiModalModel(nn.Module):
     def __init__(self, text_feature_dim, img_feature_dim, behavior_feature_dim, hidden_dim, dropout_rate=0.2):
