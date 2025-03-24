@@ -41,7 +41,7 @@ def seg_rem(data_list):
     return clean_final
 
 
-# 因子化双线性池化层（保持不变）
+# 因子化双线性池化层
 class FactorizedBilinearPooling(nn.Module):
     def __init__(self, text_feature_dim, img_feature_dim, hidden_dim):
         super(FactorizedBilinearPooling, self).__init__()
@@ -59,55 +59,77 @@ class FactorizedBilinearPooling(nn.Module):
         output = torch.sigmoid(self.bilinear_fc(bilinear_out))
         return output
 
-# 注意力机制（保持不变）
-class AttentionLayer(nn.Module):
-    def __init__(self, input_dim):
-        super(AttentionLayer, self).__init__()
-        self.attention_fc = nn.Linear(input_dim, 1)
+# 注意力机制
+class CrossModalAttention(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        # 对三个模态的拼接特征计算注意力
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim * 3, 3),  # 输出3个权重（对应文本/图像/行为）
+            nn.Softmax(dim=1)
+        )
 
-    def forward(self, x):
-        attention_weights = torch.softmax(self.attention_fc(x), dim=1)
-        weighted_input = x * attention_weights
-        return weighted_input, attention_weights
+    def forward(self, text, img, behavior):
+        combined = torch.cat([text, img, behavior], dim=1)  # shape: (batch, hidden*3)
+        weights = self.attention(combined)  # shape: (batch, 3)
+        # 扩展权重以匹配原始维度
+        text_weighted = text * weights[:, 0].unsqueeze(1)
+        img_weighted = img * weights[:, 1].unsqueeze(1)
+        behavior_weighted = behavior * weights[:, 2].unsqueeze(1)
+        return text_weighted, img_weighted, behavior_weighted, weights
 
-# 多模态模型（修改img_feature_dim参数）
+# 多模态模型
 class MultiModalModel(nn.Module):
     def __init__(self, text_feature_dim, img_feature_dim, behavior_feature_dim, hidden_dim, dropout_rate=0.2):
         super(MultiModalModel, self).__init__()
-        # 修改2：img_feature_dim从2048改为512
+        # 特征转换层
         self.text_fc = nn.Linear(text_feature_dim, hidden_dim)
         self.img_fc = nn.Linear(img_feature_dim, hidden_dim)
         self.behavior_fc = nn.Linear(behavior_feature_dim, hidden_dim)
+
+        # 注意力机制
+        self.cross_attention = CrossModalAttention(hidden_dim)
+
+        # 融合层
         self.fusion_fc = nn.Linear(hidden_dim * 3, 1)
-        self.factorized_bilinear_pooling = FactorizedBilinearPooling(hidden_dim, hidden_dim, hidden_dim)
-        self.attention_text = AttentionLayer(hidden_dim)
-        self.attention_img = AttentionLayer(hidden_dim)
-        self.attention_behavior = AttentionLayer(hidden_dim)
+        self.factorized_bilinear = FactorizedBilinearPooling(hidden_dim, hidden_dim, hidden_dim)
+
+        # 正则化
         self.dropout = nn.Dropout(dropout_rate)
+        self.layer_norm = nn.LayerNorm(hidden_dim)  # 添加层归一化
 
     def forward(self, text_features, img_features, behavior_features):
-        text_out = torch.relu(self.text_fc(text_features))
-        text_out = self.dropout(text_out)  # 在全连接层后应用 Dropout
+        # 特征投影
+        text_out = self.layer_norm(torch.relu(self.text_fc(text_features)))
+        img_out = self.layer_norm(torch.relu(self.img_fc(img_features)))
+        behavior_out = self.layer_norm(torch.relu(self.behavior_fc(behavior_features)))
 
-        img_out = torch.relu(self.img_fc(img_features))
-        img_out = self.dropout(img_out)  # 在全连接层后应用 Dropout
+        # 应用Dropout
+        text_out = self.dropout(text_out)
+        img_out = self.dropout(img_out)
+        behavior_out = self.dropout(behavior_out)
 
-        behavior_out = torch.relu(self.behavior_fc(behavior_features))
-        behavior_out = self.dropout(behavior_out)  # 在全连接层后应用 Dropout
+        # 跨模态注意力
+        text_w, img_w, behavior_w, attn_weights = self.cross_attention(
+            text_out, img_out, behavior_out
+        )
 
-        # 引入注意力机制
-        text_weighted, text_attention_weights = self.attention_text(text_out)
-        img_weighted, img_attention_weights = self.attention_img(img_out)
-        behavior_weighted, behavior_attention_weights = self.attention_behavior(behavior_out)  # 新增行为特征的注意力机制
+        # 特征融合
+        fused = torch.cat((text_w, img_w, behavior_w), dim=1)
+        fused = self.dropout(fused)
 
-        fused = torch.cat((text_weighted, img_weighted, behavior_weighted), dim=1)
-        fused = self.dropout(fused)  # 在融合层后应用 Dropout
+        # 双分支输出
+        output_main = torch.sigmoid(self.fusion_fc(fused))
+        output_bilinear = self.factorized_bilinear(text_w, img_w, behavior_w)
 
-        output = torch.sigmoid(self.fusion_fc(fused))
-        output_bilinear = self.factorized_bilinear_pooling(text_weighted, img_weighted, behavior_weighted)
-        return output, output_bilinear, text_attention_weights, img_attention_weights, behavior_attention_weights
+        return {
+            "output": output_main,
+            "output_bilinear": output_bilinear,
+            "attention_weights": attn_weights  # 形状(batch_size, 3)
+        }
 
-# 从图片文件夹中选择456个用户
+
+
 def select_users_from_images(image_folder, num_users=1289):
     image_files = os.listdir(image_folder)
     user_indices = [int(filename.split("_")[1].split(".")[0]) for filename in image_files]
@@ -309,24 +331,26 @@ best_val_loss = float('inf')
 patience = 50
 early_stop_counter = 0
 
-# 训练模型
-import pandas as pd
+# 在训练循环中记录注意力权重
+attention_weights_list = []
 
-# Create an empty DataFrame to record training and validation results
-results_df = pd.DataFrame(columns=["Epoch", "Train Loss", "Train Accuracy", "Validation Loss", "Validation Accuracy"])
-
-# Training loop
-num_epochs = 1000
 for epoch in range(num_epochs):
     model.train()
     train_loss = 0
     train_correct = 0
     train_total = 0
     for text_batch, img_batch, behavior_batch, label_batch in train_loader:
-        text_batch, img_batch, behavior_batch, label_batch = text_batch.to(device), img_batch.to(
-            device), behavior_batch.to(device), label_batch.to(device)
+        text_batch, img_batch, behavior_batch, label_batch = text_batch.to(device), img_batch.to(device), behavior_batch.to(device), label_batch.to(device)
         optimizer.zero_grad()
-        outputs, outputs_bilinear, _, _, _ = model(text_batch, img_batch, behavior_batch)
+        # 修复后的代码
+        outputs_dict = model(text_batch, img_batch, behavior_batch)
+        outputs = outputs_dict["output"]
+        outputs_bilinear = outputs_dict["output_bilinear"]
+        attn_weights = outputs_dict["attention_weights"]  # 获取权重
+
+        # 记录注意力权重
+        attention_weights_list.append(attn_weights.cpu().detach().numpy())
+
         loss = criterion(outputs, label_batch) + criterion(outputs_bilinear, label_batch)
         loss.backward()
         optimizer.step()
@@ -339,15 +363,17 @@ for epoch in range(num_epochs):
     train_accuracy = train_correct / train_total
     train_loss /= len(train_loader)
 
+    # 验证集评估
     model.eval()
     val_loss = 0
     val_correct = 0
     val_total = 0
     with torch.no_grad():
         for text_batch, img_batch, behavior_batch, label_batch in val_loader:
-            text_batch, img_batch, behavior_batch, label_batch = text_batch.to(device), img_batch.to(
-                device), behavior_batch.to(device), label_batch.to(device)
-            outputs, outputs_bilinear, _, _, _ = model(text_batch, img_batch, behavior_batch)
+            text_batch, img_batch, behavior_batch, label_batch = text_batch.to(device), img_batch.to(device), behavior_batch.to(device), label_batch.to(device)
+            outputs_dict = model(text_batch, img_batch, behavior_batch)
+            outputs = outputs_dict["output"]
+            outputs_bilinear = outputs_dict["output_bilinear"]
             val_loss += criterion(outputs, label_batch).item() + criterion(outputs_bilinear, label_batch).item()
             predicted = (outputs > 0.5).float()
             val_total += label_batch.size(0)
@@ -356,23 +382,7 @@ for epoch in range(num_epochs):
     val_accuracy = val_correct / val_total
     val_loss /= len(val_loader)
 
-    # Step the scheduler and get the learning rate
-    scheduler.step(val_loss)
-    current_lr = scheduler.get_last_lr()[0]  # Access the learning rate
-
-    # Append results to the DataFrame using pd.concat
-    new_row = pd.DataFrame({
-        "Epoch": [epoch + 1],
-        "Train Loss": [train_loss],
-        "Train Accuracy": [train_accuracy],
-        "Validation Loss": [val_loss],
-        "Validation Accuracy": [val_accuracy]
-    })
-    results_df = pd.concat([results_df, new_row], ignore_index=True)
-
-    print(
-        f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss}, Train Accuracy: {train_accuracy}, Validation Loss: {val_loss}, Validation Accuracy: {val_accuracy}, Learning Rate: {current_lr}")
-
+    # 早停策略
     if val_loss < best_val_loss:
         best_val_loss = val_loss
         early_stop_counter = 0
@@ -381,7 +391,6 @@ for epoch in range(num_epochs):
         if early_stop_counter >= patience:
             print("Early stopping triggered")
             break
-
 
 # 评价
 def evaluate_model(model, data_loader):
