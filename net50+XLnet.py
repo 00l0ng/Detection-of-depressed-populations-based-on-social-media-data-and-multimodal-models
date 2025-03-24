@@ -67,8 +67,15 @@ class CrossModalAttention(nn.Module):
             nn.Linear(hidden_dim * 3, 3),  # 输出3个权重（对应文本/图像/行为）
             nn.Softmax(dim=1)
         )
+        self.img_weight_bias = nn.Parameter(torch.tensor(1.0))
+        self.text_weight_bias = nn.Parameter(torch.tensor(1.0))
+        self.behavior_weight_bias = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, text, img, behavior):
+        # 扩展图像特征的权重
+        img = img * self.img_weight_bias
+        text=text*self.text_weight_bias
+        behavior=behavior*self.behavior_weight_bias
         combined = torch.cat([text, img, behavior], dim=1)  # shape: (batch, hidden*3)
         weights = self.attention(combined)  # shape: (batch, 3)
         # 扩展权重以匹配原始维度
